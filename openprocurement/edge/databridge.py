@@ -46,7 +46,9 @@ WORKER_CONFIG = {
     'retries_count': 10,
     'queue_timeout': 3,
     'bulk_save_limit': 1000,
-    'bulk_save_interval': 5
+    'bulk_save_interval': 5,
+    'historical': False,
+    'token': '',
 }
 
 DEFAULTS = {
@@ -171,7 +173,7 @@ class EdgeDataBridge(object):
             try:
                 api_client = APIClient(
                     host_url=self.api_host, user_agent=client_user_agent,
-                    api_version=self.api_version, key='',
+                    api_version=self.api_version, key=self.workers_config['token'],
                     resource=self.workers_config['resource'])
                 client_id = uuid.uuid4().hex
                 logger.info('Started api_client {}'.format(
@@ -214,46 +216,81 @@ class EdgeDataBridge(object):
 
     def fill_input_queue(self):
         for resource_item in self.feeder.get_resource_items():
-            self.input_queue.put(resource_item)
-            logger.debug('Add to temp queue from sync: {} {} {}'.format(
-                self.workers_config['resource'][:-1], resource_item['id'],
-                resource_item['dateModified']),
-                extra={'MESSAGE_ID': 'received_from_sync',
-                       'TEMP_QUEUE_SIZE': self.input_queue.qsize()})
+            if self.workers_config['historical']:
+                client = self.api_clients_queue.get()
+                sleep_duration = 0.5
+                try:
+                    current = client['client'].get_resource_item_historical(resource_item['id'])
+                    sleep_duration = max(0, sleep_duration - 0.5)
+                except RequestFailed as e:
+                    if e.status_code == "429":
+                        sleep_duration += 1
+                        gevent.sleep(sleep_duration)
+
+                revs_num = int(current['x_revision_n'])
+                for index in range(revs_num):
+                    if resource_item['id'] + "-{}".format(index + 1) in self.db:
+                        continue
+                    self.input_queue.put({
+                        'id': resource_item['id'],
+                        'rev': index + 1
+                    })
+                    logger.debug('Add to temp queue from sync: {} {}-{}'.format(
+                        self.workers_config['resource'][:-1], resource_item['id'], index + 1),
+                        extra={'MESSAGE_ID': 'received_from_sync',
+                               'TEMP_QUEUE_SIZE': self.input_queue.qsize()})
+                self.api_clients_queue.put(client)
+            else:
+                self.input_queue.put(resource_item)
+                logger.debug('Add to temp queue from sync: {} {} {}'.format(
+                    self.workers_config['resource'][:-1], resource_item['id'],
+                    resource_item['dateModified']),
+                    extra={'MESSAGE_ID': 'received_from_sync',
+                           'TEMP_QUEUE_SIZE': self.input_queue.qsize()})
 
     def send_bulk(self, input_dict):
-        sleep_before_retry = 2
-        for i in xrange(0, 3):
-            try:
-                logger.debug('Send check bulk: {}'.format(len(input_dict)),
-                             extra={'CHECK_BULK_LEN': len(input_dict)})
-                start = time()
-                rows = self.db.view(self.view_path, keys=input_dict.values())
-                end = time() - start
-                logger.debug('Duration bulk ckeck: {} sec.'.format(end),
-                             extra={'CHECK_BULK_DURATION': end * 1000})
-                resp_dict = {k.id: k.key for k in rows}
-                break
-            except (IncompleteRead, Exception) as e:
-                logger.error('Error while send bulk {}'.format(e.message),
-                             extra={'MESSAGE_ID': 'exceptions'})
-                if i == 2:
-                    raise e
-                sleep(sleep_before_retry)
-                sleep_before_retry *= 2
-        for item_id, date_modified in input_dict.items():
-            if item_id in resp_dict and date_modified == resp_dict[item_id]:
-                logger.debug('Ignored {} {}: SYNC - {}, EDGE - {}'.format(
-                    self.workers_config['resource'][:-1], item_id,
-                    date_modified, resp_dict[item_id]),
-                    extra={'MESSAGE_ID': 'skiped'})
-            else:
-                self.resource_items_queue.put(
-                    {'id': item_id, 'dateModified': date_modified})
+        if self.workers_config['historical']:
+            for item_id, item_rev in input_dict.items():
+                self.resource_items_queue.put({
+                    'id': item_id,
+                    'rev': item_rev
+                })
                 logger.debug('Put to main queue {}: {} {}'.format(
-                    self.workers_config['resource'][:-1], item_id,
-                    date_modified),
+                    self.workers_config['resource'][:-1], item_id, item_rev),
                     extra={'MESSAGE_ID': 'add_to_resource_items_queue'})
+        else:
+            sleep_before_retry = 2
+            for i in xrange(0, 3):
+                try:
+                    logger.debug('Send check bulk: {}'.format(len(input_dict)),
+                                 extra={'CHECK_BULK_LEN': len(input_dict)})
+                    start = time()
+                    rows = self.db.view(self.view_path, keys=input_dict.values())
+                    end = time() - start
+                    logger.debug('Duration bulk check: {} sec.'.format(end),
+                                 extra={'CHECK_BULK_DURATION': end * 1000})
+                    resp_dict = {k.id: k.key for k in rows}
+                    break
+                except (IncompleteRead, Exception) as e:
+                    logger.error('Error while send bulk {}'.format(e.message),
+                                 extra={'MESSAGE_ID': 'exceptions'})
+                    if i == 2:
+                        raise e
+                    sleep(sleep_before_retry)
+                    sleep_before_retry *= 2
+            for item_id, date_modified in input_dict.items():
+                if item_id in resp_dict and date_modified == resp_dict[item_id]:
+                    logger.debug('Ignored {} {}: SYNC - {}, EDGE - {}'.format(
+                        self.workers_config['resource'][:-1], item_id,
+                        date_modified, resp_dict[item_id]),
+                        extra={'MESSAGE_ID': 'skipped'})
+                else:
+                    self.resource_items_queue.put(
+                        {'id': item_id, 'dateModified': date_modified})
+                    logger.debug('Put to main queue {}: {} {}'.format(
+                        self.workers_config['resource'][:-1], item_id,
+                        date_modified),
+                        extra={'MESSAGE_ID': 'add_to_resource_items_queue'})
 
     def fill_resource_items_queue(self):
         start_time = datetime.now()
@@ -275,7 +312,10 @@ class EdgeDataBridge(object):
             # Add resource_item to bulk
             if resource_item is not None:
                 logger.debug('Add to input_dict {}'.format(resource_item['id']))
-                input_dict[resource_item['id']] = resource_item['dateModified']
+                if self.workers_config['historical']:
+                    input_dict[resource_item['id']] = resource_item['rev']
+                else:
+                    input_dict[resource_item['id']] = resource_item['dateModified']
 
             if (len(input_dict) >= self.bulk_query_limit or
                 (datetime.now() - start_time).total_seconds() >=
